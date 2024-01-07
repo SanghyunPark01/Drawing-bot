@@ -1,0 +1,10 @@
+<launch>
+	
+    <rosparam command="load" file="$(find planning_image_drawing)/config/settings.yaml" />
+    <rosparam command="load" file="$(find planning_image_drawing)/config/camera_params.yaml" />
+
+    <node pkg="planning_image_drawing" type="process_node" name="process_node" output="screen"/>
+    <node pkg="pyqt_ros_example" type="main_node.py" name="main_node" output="screen"/>
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch" />
+
+</launch>

@@ -1,0 +1,10 @@
+param:
+  name:
+    image_topic: "/camera/color/image_raw"
+    image_flag_topic: "/set_img_flag"
+    drawing_type_topic: "/drawing_type"
+    start_calcuate_topic: "/calcuate_flag"
+    pub_path_flag: "/drawing_start_flag"
+
+    pub_msg_capture_img: "/captured_img"
+    pub_msg_drawing_path: "/drawing_path"

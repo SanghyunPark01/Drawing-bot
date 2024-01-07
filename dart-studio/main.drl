@@ -1,0 +1,718 @@
+import numpy as np
+import math
+import time
+from queue import Queue, Empty
+
+ONLY_ONCE = False
+
+# 길이 설정
+SCALE = 0.7
+WIDTH = 640
+HEIGHT = 480
+
+# 기본 속도 설정
+DEFAULT_VELJ = 100
+DEFAULT_ACCJ = 100
+DEFAULT_VELX = 300
+DEFAULT_ACCX = 300
+
+# 기본 충돌 기준값
+COLLISION_THRESHOLD = 15
+
+# 기본 좌표 설정
+DEFAULT_X = -300
+DEFAULT_Y = 180
+DEFAULT_Z = 206
+DEFAULT_Z_UP = DEFAULT_Z + 20
+
+CURRENT_Z = DEFAULT_Z_UP
+
+# 통신 Register
+POINTS_NUM_REGISTER = 128  # 데이터 개수
+POINTS_X_REGISTER = 129  # x 좌표
+POINTS_Y_REGISTER = 130  # y좌표
+GET_POINTS_IDX_REGISTER = 131  # 데이터 전송 번호 수신 (수신)
+SEND_POINTS_IDX_REGISTER = 132  # 데이터를 받는 것을 성공하면 보내는 곳 (송신)
+
+START_GET_POINT_FLAG = POINTS_NUM_REGISTER  # 1을 주면 포인트를 주는 것 실시 (통신 단계 시작 FLAG)
+
+# 특이 행동 Register
+STOP_REGISTER = 200  # 1을 주면 멈춤
+PAUSE_REGISTER = 201  # 일시 정지
+START_REGISTER = 202  # 1을 주면 그리기 시작 (사용 안함)
+END_REGISTER = 203  # 프로그램 종료
+SLOW_REGISTER = 204  # 속도 느리게
+
+# 송신
+SUCCESS_REGISTER = 210  # 다 그리면 1을 줌
+
+# 값
+UP = 2**16 - 1
+DOWN = 2**16 - 2
+
+# BLENDING 값
+BLENDING = 2  # 블렌딩 정도 [mm]
+START_BLENDING = 2**15 + 1  # 이 값을 전해주면 BLENDING 시작
+END_BLENDING = 2**15  # 이 값을 전해주면 BLENDING 종료
+
+# 로봇 상태 확인 전역 변수
+BLENDING_FLAG = False  # 현재 BLENDING 여부
+SLOW_FLAG = False
+
+ROBOT_STOP = False  # 로봇의 동작 여부를 판단 (어떤 상태든 로봇이 정지하면 True)
+STOP_FLAG = False  # 정지 사유 1: 로봇 동작 정지 신호
+PAUSE_FLAG = False  # 정지사유 2 : 로봇 일시 정지 신호
+COLLISION_FLAG = 134  # 정지사유 3 : 로봇 충돌 신호
+
+# 스레딩 포인트 저장소
+THREADING_FLAG = True
+Thread_Points_Queue = Queue()
+Thread_Points_Num = 0
+
+
+def threading_func():
+    """스레드 내부에서 진행되는 기능들
+    0. 기본 속도를 조절한다.
+    1. STOP_REGISTER가 켜지면 로봇을 정지시킨다.
+    2. STOP_REGISTER가 켜지면 로봇을 정지시킨다.
+    3. SLOW_REGISTER가 켜지면 로봇이 느려진다.
+    4. 충돌 감지시 정지
+    """
+    # 속도 기본값
+    global DEFAULT_VELJ, DEFAULT_ACCJ
+    global DEFAULT_VELX, DEFAULT_ACCX
+    set_velj(DEFAULT_VELJ)
+    set_accj(DEFAULT_ACCJ)
+    set_velx(DEFAULT_VELX)
+    set_accx(DEFAULT_ACCX)
+
+    # 정지 사유 1: 로봇 동작 정지 신호
+    global STOP_REGISTER, STOP_FLAG
+    if get_modbus_slave(STOP_REGISTER):
+        STOP_FLAG = True
+    else:
+        STOP_FLAG = False
+
+    # 정지사유 2 : 로봇 일시 정지 신호
+    global PAUSE_REGISTER, PUASE_FLAG
+    if get_modbus_slave(PAUSE_REGISTER):
+        PUASE_FLAG = True
+    else:
+        PUASE_FLAG = False
+
+    # 정지사유 3 : 로봇 충돌 신호
+    global COLLISION_FLAG, COLLISION_THRESHOLD
+    torque = np.array(get_external_torque())
+    torque = np.sqrt(np.sum(torque**2))
+    if torque > COLLISION_THRESHOLD:
+        COLLISION_FLAG = True
+    else:
+        COLLISION_FLAG = False
+
+    # 로봇의 정지
+    global ROBOT_STOP
+    if COLLISION_FLAG or PUASE_FLAG or STOP_FLAG:
+        ROBOT_STOP = True
+        stop(DR_SSTOP)
+        mwait(0)
+        return
+    else:
+        ROBOT_STOP = False
+
+    # 로봇 느리게 (정지 X)
+    global SLOW_REGISTER, SLOW_FLAG
+    if get_modbus_slave(SLOW_REGISTER):
+        change_operation_speed(10)
+        SLOW_FLAG = True
+    else:
+        change_operation_speed(100)
+        SLOW_FLAG = False
+
+
+thread_run(threading_func, loop=True)
+
+
+def get_posx(_posx, raw=False):
+    """x(0~640), y(0~480)의 좌표값을 로봇 기준 좌표계로 변경"""
+    global DEFAULT_X, DEFAULT_Y, CURRENT_Z, SCALE
+    if raw:
+        tar_x = _posx[0]
+        tar_y = _posx[1]
+    else:
+        tar_x = DEFAULT_X + _posx[0] * SCALE
+        tar_y = DEFAULT_Y + _posx[1] * SCALE
+
+    tar_posx = [tar_x, tar_y, CURRENT_Z, 90, 180, 0]
+
+    return tar_posx
+
+
+def check_flags():
+    """STOP_REGISTER를 받으면 로봇이 플래그라 풀릴 때까지 정지"""
+    global ROBOT_STOP, STOP_FLAG, PAUSE_FLAG, COLLISION_FLAG
+    while ROBOT_STOP:
+        if STOP_FLAG:
+            return False
+        elif PAUSE_FLAG or COLLISION_FLAG:
+            mwait(0.1)
+    return True
+
+
+def waiting_before_action_end():
+    """이전 동작이 끝날 때까지 대기"""
+    mwait(0)
+
+
+def move_to(point, raw=False, blocking=False):
+    """특정한 점으로 이동하는 함수
+    blocking : 이번 동작이 완전히 끝날 때까지 대기 (Non Blending)
+    before_blocking : 이전 동작이 완전히 끝난 후 수행
+    """
+    point = get_posx(point, raw=raw)
+    if not check_flags():
+        return False
+    amovel(point)
+    if blocking:
+        waiting_before_action_end()
+    return True
+
+
+def move_up():
+    """현재 좌표의 위로 이동"""
+    global CURRENT_Z, DEFAULT_Z_UP
+    waiting_before_action_end()
+    CURRENT_Z = DEFAULT_Z_UP
+    cur_posx, _ = get_current_posx()
+    move_to(cur_posx[:2], raw=True, blocking=True)
+
+
+def move_down():
+    """현재 좌표의 위로 이동"""
+    global CURRENT_Z, DEFAULT_Z
+    waiting_before_action_end()
+    CURRENT_Z = DEFAULT_Z
+    cur_posx, _ = get_current_posx()
+    move_to(cur_posx[:2], raw=True, blocking=True)
+
+
+def up_and_down(reverse=False):
+    """위로 이동했다 아래로 이동"""
+    if reverse:
+        move_down()
+        move_up()
+    else:
+        move_up()
+        move_down()
+
+
+def move_edge(z_test=False):
+    """최대 거리를 외곽선을 따라 이동"""
+    global WIDTH, HEIGHT
+    move_up()
+    move_to([0, 0], blocking=True)
+    move_down()
+    move_to([WIDTH, 0], blocking=True)
+    if z_test:
+        up_and_down()
+    move_to([WIDTH, HEIGHT], blocking=True)
+    if z_test:
+        up_and_down()
+    move_to([0, HEIGHT], blocking=True)
+    if z_test:
+        up_and_down()
+    move_to([0, 0], blocking=True)
+    move_up()
+
+
+def special_acting(point):
+    """
+    points의 집합에 특정 좌표값을 집어넣어서 특정 동작을 수행
+    1. 로봇의 현재 높이 단계를 변경하는 방법 (UP/DOWN)
+    2. 이전 동작의 완료 대기 여부를 선택하는 방법 (START/END_BLENDING)
+    """
+    global CURRENT_Z, UP, DOWN, START_BLENDING, END_BLENDING, BLENDING_FLAG
+    x = point[0]
+    y = point[1]
+    if x == UP or y == UP:
+        move_up()
+    elif x == DOWN or y == DOWN:
+        move_down()
+    elif x == START_BLENDING or y == START_BLENDING:
+        BLENDING_FLAG = True
+    elif x == END_BLENDING or y == END_BLENDING:
+        BLENDING_FLAG = False
+
+
+def drawing(points=None, threading=False):
+    """그림 경로의 집합을 받아 그림을 그리는 함수"""
+    global BLENDING, BLENDING_FLAG
+    begin_blend(radius=BLENDING)
+    BLENDING_FLAG = True
+    if not threading:
+        for i, point in enumerate(points):
+            x = point[0]
+            y = point[1]
+            if x > 2**12 or y > 2**12:
+                special_acting(point)
+            else:
+                move_to(point)
+                if not BLENDING_FLAG:
+                    waiting_before_action_end()
+    else:
+        global Thread_Points_Queue, Thread_Points_Num
+        for _ in range(Thread_Points_Num):
+            while True:
+                try:
+                    point = Thread_Points_Queue.get(block=False)
+                    x = point[0]
+                    y = point[1]
+                    if x > 2**12 or y > 2**12:
+                        special_acting(point)
+                    else:
+                        move_to(point)
+                        if not BLENDING_FLAG:
+                            waiting_before_action_end()
+                    break
+                except Empty:
+                    continue
+    end_blend()
+    BLENDING_FLAG = False
+
+
+def get_points(threading=THREADING_FLAG):
+    """통신을 통해서 그림을 그리는 경로를 가져오는 함수"""
+    global POINTS_NUM_REGISTER, POINTS_X_REGISTER, POINTS_Y_REGISTER, GET_POINTS_IDX_REGISTER, SEND_POINTS_IDX_REGISTER
+    points_num = get_modbus_slave(POINTS_NUM_REGISTER)
+    if not threading:
+        points = []
+    else:
+        global Thread_Points_Queue, Thread_Points_Num
+        Thread_Points_Queue = Queue()
+        Thread_Points_Num = points_num
+
+    start = time.time()
+    for points_idx in range(1, points_num + 1):
+        set_modbus_slave(SEND_POINTS_IDX_REGISTER, points_idx)
+        while points_idx != get_modbus_slave(GET_POINTS_IDX_REGISTER):
+            a1 = get_modbus_slave(POINTS_NUM_REGISTER)
+            a2 = get_modbus_slave(POINTS_X_REGISTER)
+            a3 = get_modbus_slave(POINTS_Y_REGISTER)
+            a4 = get_modbus_slave(GET_POINTS_IDX_REGISTER)
+            a5 = get_modbus_slave(SEND_POINTS_IDX_REGISTER)
+            tp_log(
+                "STEP 02 : Waiting for Next Points {}/{} <- [{},{},{},{},{}]".format(
+                    points_idx, points_num, a1, a2, a3, a4, a5
+                )
+            )
+            wait(0.01)
+        x = get_modbus_slave(POINTS_X_REGISTER)
+        y = get_modbus_slave(POINTS_Y_REGISTER)
+        if not threading:
+            points.append([x, y])
+        else:
+            Thread_Points_Queue.put([x, y])
+
+    end = time.time()
+    elapsed = end - start
+    tp_log("All Time : {}s, Average Time: {}s".format(elapsed, elapsed / points_num))
+
+    set_modbus_slave(POINTS_NUM_REGISTER, 0)
+    set_modbus_slave(POINTS_X_REGISTER, 0)
+    set_modbus_slave(POINTS_Y_REGISTER, 0)
+    set_modbus_slave(GET_POINTS_IDX_REGISTER, 0)
+    set_modbus_slave(SEND_POINTS_IDX_REGISTER, 0)
+
+    if not threading:
+        return points
+
+
+def get_circle_posx_by_center(center=[WIDTH / 2, HEIGHT / 2], R=50, num_points=360):
+    """center를 중심으로 반지름 R의 num_points개의 좌표를 얻는다."""
+    angle = np.linspace(0, 360, num_points + 1)
+    rad_list = np.deg2rad(angle)
+
+    points = []
+    for rad in rad_list:
+        point = (center[0] + R * math.cos(rad), center[1] + R * math.sin(rad))
+        points.append(point)
+    return points
+
+
+def get_circle_posx_by_start_posx(
+    start_posx, R, degree, draw_degree, num_points=360, x_scale=1, y_scale=1
+):
+    """start_posx에서 그리기 시작
+    이때 반지름이 R이고 현재 지점이 각도가 degree인 원을 그린다.
+    그리는 각도은 draw_degree로 양수이면 반시계, 음수면 시계 방향으로 그린다.
+    """
+    center_x = start_posx[0] - R * math.cos(np.deg2rad(degree))
+    center_y = start_posx[1] - R * math.sin(np.deg2rad(degree))
+    center = [center_x, center_y]
+
+    angle = np.linspace(degree, degree + draw_degree, num_points + 1)
+    rad_list = np.deg2rad(angle)
+
+    points = []
+    for rad in rad_list:
+        point = (
+            center[0] + x_scale * R * math.cos(rad),
+            center[1] + y_scale * R * math.sin(rad),
+        )
+        points.append(point)
+    return points
+
+
+def change_number_posx(points, base_posx, width, height):
+    """숫자를 그리는 함수를 도와주는 좌표 변환 함수
+    base_posx(좌측 아래)를 기준으로 width와 height를 활용해
+    적절한 크기의 points 위치로 변환한다.
+    """
+    global START_BLENDING, END_BLENDING
+    start_blending_list = []
+    end_blending_list = []
+    for i, point in enumerate(points):
+        x = point[0]
+        y = point[1]
+
+        if x == START_BLENDING or y == START_BLENDING:
+            start_blending_list.append(i)
+        elif x == END_BLENDING or y == END_BLENDING:
+            end_blending_list.append(i)
+
+    points = np.array(points)
+    points[:, 0] *= width
+    points[:, 1] *= height
+
+    points[:, 0] += base_posx[0]
+    points[:, 1] += base_posx[1]
+
+    points[start_blending_list, :] = START_BLENDING
+    points[end_blending_list, :] = END_BLENDING
+
+    return points
+
+
+def draw_one(base_posx, width, height):
+    global END_BLENDING
+    points = np.array(
+        [
+            [
+                0.2,
+                0.8,
+            ],
+            [END_BLENDING, END_BLENDING],
+            [0.5, 0.9],
+            [0.5, 0.2],
+            [0.2, 0.2],
+            [0.8, 0.2],
+        ]
+    )
+    points = change_number_posx(points, base_posx, width, height)
+
+    return points
+
+
+def draw_two(base_posx, width, height):
+    global END_BLENDING
+    points = np.array(
+        [
+            [
+                0.2,
+                0.8,
+            ]
+        ]
+    )
+    points = change_number_posx(points, base_posx, width, height)
+
+    add_points = get_circle_posx_by_start_posx(
+        points[-1], 0.3 * width, degree=180, draw_degree=-180, num_points=10
+    )
+    points = np.vstack((points, add_points))
+
+    add_points = np.array([[END_BLENDING, END_BLENDING], [0.2, 0.2], [0.8, 0.2]])
+    add_points = change_number_posx(add_points, base_posx, width, height)
+    points = np.vstack((points, add_points))
+
+    return points
+
+
+def draw_three(base_posx, width, height):
+    points = np.array(
+        [
+            [
+                0.2,
+                0.8,
+            ]
+        ]
+    )
+    points = change_number_posx(points, base_posx, width, height)
+
+    add_points = get_circle_posx_by_start_posx(
+        points[-1], 0.3 * width, degree=160, draw_degree=-270, num_points=12
+    )
+    points = np.vstack((points, add_points))
+
+    add_points = get_circle_posx_by_start_posx(
+        points[-1], 0.3 * width, degree=110, draw_degree=-270, num_points=12
+    )
+    points = np.vstack((points, add_points))
+
+    return points
+
+
+def draw_four(base_posx, width, height):
+    global END_BLENDING
+    points = np.array(
+        [
+            [
+                0.8,
+                0.4,
+            ],
+            [END_BLENDING, END_BLENDING],
+            [0.2, 0.4],
+            [0.6, 0.9],
+            [0.6, 0.2],
+        ]
+    )
+    points = change_number_posx(points, base_posx, width, height)
+
+    return points
+
+
+def draw_five(base_posx, width, height):
+    global END_BLENDING, START_BLENDING
+    points = np.array(
+        [
+            [
+                0.8,
+                0.8,
+            ],
+            [END_BLENDING, END_BLENDING],
+            [0.2, 0.8],
+            [0.2, 0.6],
+            [START_BLENDING, START_BLENDING],
+        ]
+    )
+    points = change_number_posx(points, base_posx, width, height)
+
+    add_points = get_circle_posx_by_start_posx(
+        points[-2], 0.3 * width, degree=135, draw_degree=-270, num_points=10
+    )
+    points = np.vstack((points, add_points))
+
+    return points
+
+
+def draw_six(base_posx, width, height):
+    global END_BLENDING, START_BLENDING
+    points = np.array(
+        [
+            [
+                0.8,
+                0.8,
+            ],
+            [END_BLENDING, END_BLENDING],
+            [0.2, 0.4],
+            [START_BLENDING, START_BLENDING],
+        ]
+    )
+    points = change_number_posx(points, base_posx, width, height)
+
+    add_points = get_circle_posx_by_start_posx(
+        points[-2], 0.3 * width, degree=150, draw_degree=-360, num_points=16
+    )
+    points = np.vstack((points, add_points))
+
+    return points
+
+
+def draw_seven(base_posx, width, height):
+    global END_BLENDING
+    points = np.array(
+        [
+            [
+                0.3,
+                0.6,
+            ],
+            [END_BLENDING, END_BLENDING],
+            [0.2, 0.8],
+            [0.8, 0.8],
+            [0.7, 0.2],
+        ]
+    )
+    points = change_number_posx(points, base_posx, width, height)
+
+    return points
+
+
+def draw_eight(base_posx, width, height):
+    points = np.array(
+        [
+            [
+                0.5,
+                0.6,
+            ]
+        ]
+    )
+    points = change_number_posx(points, base_posx, width, height)
+
+    add_points = get_circle_posx_by_start_posx(
+        points[-1], 0.15 * height, degree=270, draw_degree=360, num_points=30
+    )
+    points = np.vstack((points, add_points))
+
+    add_points = get_circle_posx_by_start_posx(
+        points[-1], 0.25 * height, degree=90, draw_degree=360, num_points=30
+    )
+    points = np.vstack((points, add_points))
+
+    return points
+
+
+def draw_nine(base_posx, width, height):
+    points = np.array([[0.4, 0.2], [0.7, 0.7]])
+    points = change_number_posx(points, base_posx, width, height)
+
+    add_points = get_circle_posx_by_start_posx(
+        points[-1], 0.15 * height, degree=-45, draw_degree=360, num_points=30
+    )
+    points = np.vstack((points, add_points))
+
+    return points
+
+
+def draw_zero(base_posx, width, height):
+    points = np.array([[0.2, 0.5]])
+    points = change_number_posx(points, base_posx, width, height)
+
+    add_points = get_circle_posx_by_start_posx(
+        points[-1],
+        0.3 * width,
+        degree=180,
+        draw_degree=360,
+        num_points=30,
+        y_scale=height / width,
+    )
+    points = np.vstack((points, add_points))
+
+    return points
+
+
+def draw_number(number, base_posx, width, height):
+    if number == 1:
+        points = draw_one(base_posx, width, height)
+    elif number == 2:
+        points = draw_two(base_posx, width, height)
+    elif number == 3:
+        points = draw_three(base_posx, width, height)
+    elif number == 4:
+        points = draw_four(base_posx, width, height)
+    elif number == 5:
+        points = draw_five(base_posx, width, height)
+    elif number == 6:
+        points = draw_six(base_posx, width, height)
+    elif number == 7:
+        points = draw_seven(base_posx, width, height)
+    elif number == 8:
+        points = draw_eight(base_posx, width, height)
+    elif number == 9:
+        points = draw_nine(base_posx, width, height)
+    else:
+        points = draw_zero(base_posx, width, height)
+
+    return points
+
+
+def draw_number_list(number_list, base_posx, font_size=10):
+    global THREADING_FLAG
+    width = font_size
+    height = font_size * 2
+    first_base_posx = base_posx
+    for number in number_list:
+        if number == "\n":
+            base_posx = (first_base_posx[0], first_base_posx[1] - height)
+            first_base_posx = base_posx
+            continue
+        elif number == " ":
+            base_posx = (base_posx[0] + width, base_posx[1])
+            continue
+        points = draw_number(number, base_posx, width, height)
+        move_up()
+        move_to(points[0])
+        move_down()
+        flag_temp = THREADING_FLAG
+        THREADING_FLAG = False
+        drawing(points)
+        THREADING_FLAG = flag_temp
+        base_posx = (base_posx[0] + width, base_posx[1])
+    move_up()
+
+
+# 통신 관련 플래그
+set_modbus_slave(POINTS_NUM_REGISTER, 0)
+set_modbus_slave(POINTS_X_REGISTER, 0)
+set_modbus_slave(POINTS_Y_REGISTER, 0)
+set_modbus_slave(GET_POINTS_IDX_REGISTER, 0)
+set_modbus_slave(SEND_POINTS_IDX_REGISTER, 0)
+set_modbus_slave(START_GET_POINT_FLAG, 0)
+
+# 특이 행동 플래그
+set_modbus_slave(STOP_REGISTER, 0)
+set_modbus_slave(PAUSE_REGISTER, 0)
+set_modbus_slave(START_REGISTER, 0)
+set_modbus_slave(END_REGISTER, 0)
+set_modbus_slave(SLOW_REGISTER, 0)
+
+# 완성 플래그
+set_modbus_slave(SUCCESS_REGISTER, 1)
+
+tp_log("Program Start!!")
+movej([90,0,90,0,90,0])
+while True:
+    tp_log("Step!")
+    temp_z = DEFAULT_Z_UP
+    DEFAULT_Z_UP = 300
+    move_up()
+    DEFAULT_Z_UP = temp_z
+    
+    if ONLY_ONCE:
+        font_size = 15
+        move_edge()
+        draw_number_list([2,0,2,3,' ',1,2,' ',1,9],(WIDTH-font_size*10,font_size*(-2)), font_size=font_size)
+        ONLY_ONCE = False
+    
+    if get_modbus_slave(END_REGISTER):
+        break
+
+    while not get_modbus_slave(START_GET_POINT_FLAG):
+        a1 = get_modbus_slave(POINTS_NUM_REGISTER)
+        a2 = get_modbus_slave(POINTS_X_REGISTER)
+        a3 = get_modbus_slave(POINTS_Y_REGISTER)
+        a4 = get_modbus_slave(GET_POINTS_IDX_REGISTER)
+        a5 = get_modbus_slave(SEND_POINTS_IDX_REGISTER)
+        tp_log(
+            "STEP 01 : Waiting for GET Points... [{},{},{},{},{}]".format(
+                a1, a2, a3, a4, a5
+            )
+        )
+        wait(0.1)
+
+    set_modbus_slave(SUCCESS_REGISTER, 0)
+    if not THREADING_FLAG:
+        points = get_points()
+        tp_log(str(points))
+        tp_log("Success!!")
+        drawing(points)
+    else:
+        tp_log("Threading Start!")
+        thread_id = thread_run(get_points, loop=False)
+        drawing(threading=True)
+    
+    temp_z = DEFAULT_Z_UP
+    DEFAULT_Z_UP = 300
+    move_up()
+    DEFAULT_Z_UP = temp_z
+    if THREADING_FLAG:
+        thread_stop(thread_id)
+    set_modbus_slave(SUCCESS_REGISTER, 1)
+    tp_log("End Drawing!")

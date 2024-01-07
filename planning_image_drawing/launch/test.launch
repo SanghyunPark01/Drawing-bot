@@ -1,0 +1,10 @@
+<launch>
+	
+    <rosparam command="load" file="$(find planning_image_drawing)/config/settings.yaml" />
+    <rosparam command="load" file="$(find planning_image_drawing)/config/camera_params.yaml" />
+
+    <node pkg="planning_image_drawing" type="process_node" name="process_node" output="screen"/>
+	<node pkg="planning_image_drawing" type="pub_image_node" name="pub_image_node" output="screen"/>
+
+
+</launch>
